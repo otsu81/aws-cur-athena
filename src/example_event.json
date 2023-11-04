@@ -1,0 +1,38 @@
+{
+  "Records": [
+      {
+          "eventVersion": "2.1",
+          "eventSource": "aws:s3",
+          "awsRegion": "us-east-1",
+          "eventTime": "2023-10-13T12:24:00.529Z",
+          "eventName": "ObjectCreated:Put",
+          "userIdentity": {
+              "principalId": "AWS:AROASLF4OCAYLMDRUM5CT:carl.fagerlin1@inter.ikea.com"
+          },
+          "requestParameters": {
+              "sourceIPAddress": "92.34.202.254"
+          },
+          "responseElements": {
+              "x-amz-request-id": "Z5YSSPMKMKD70ZFB",
+              "x-amz-id-2": "96yxxEf2FZnw+eSMBMmgRCwq9FVJAzOwtZtUvgUPnr4MOPaoXyaSkoCcn38fbwMJvT/lQbrImz7QXrPhFjZtrMNBnDGUc3im"
+          },
+          "s3": {
+              "s3SchemaVersion": "1.0",
+              "configurationId": "newPut",
+              "bucket": {
+                  "name": "cost-usage-report-161456459824",
+                  "ownerIdentity": {
+                      "principalId": "A37OIN56BJDBGX"
+                  },
+                  "arn": "arn:aws:s3:::cost-usage-report-161456459824"
+              },
+              "object": {
+                  "key": "161456459824/athena/161456459824AthenaCur/161456459824AthenaCur/year%3D2023/month%3D10/161456459824AthenaCur-00001.snappy.parquet",
+                  "size": 927,
+                  "eTag": "3b2695a3553bba8c968e107c0f3a479b",
+                  "sequencer": "00652936E0610899D8"
+              }
+          }
+      }
+  ]
+}

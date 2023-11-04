@@ -1,0 +1,21 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "arn:aws:iam::111111111111:root"
+      },
+      "Action": "s3:PutObject",
+      "Resource": "arn:aws:s3:::cost-usage-reports-aggregated/curs/account=111111111111/*"
+    },
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "arn:aws:iam::222222222222:root"
+      },
+      "Action": "s3:PutObject",
+      "Resource": "arn:aws:s3:::cost-usage-reports-aggregated/curs/account=222222222222/*"
+    }
+  ]
+}

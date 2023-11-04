@@ -1,0 +1,168 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >
+  Creates Cost & Usage Report ("CUR") with associated S3 bucket and appropriate
+  bucket policy. Creates a Lambda function that copies CUR files from the
+  CUR bucket to a target bucket. Intended to be used with AWS Athena.
+  !! NOTE !! CUR can only be created in US-EAST-1, and can only work with S3
+            buckets in US-EAST-1. Cloudformation will FAIL deployment in any
+            other region.
+  !! NOTE !! If deploying "fresh", the NotificationConfiguration in the bucket
+            policy will fail to deploy due to circular dependencies (known bug
+            in Cloudformation when creating lambda push events). Comment it out,
+            deploy, uncomment it, and deploy again.
+
+Parameters:
+  CurBucketPrefix:
+    Type: String
+    Default: cost-usage-report
+    Description: Prefix for the CUR bucket name
+  CurAggregationBucket:
+    Type: String
+    Default: cost-usage-reports-aggregated
+    Description: The target bucket for the CUR files. Must have a bucket policy allowing the lambda to write to it.
+  TargetBucketDefaultPath:
+    Type: String
+    Default: curs/
+    Description: The default path for the CUR files in the target bucket
+
+Resources:
+  CostUsageReportBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${CurBucketPrefix}-${AWS::AccountId}
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteAfterTwoYears
+            Status: Enabled
+            ExpirationInDays: 730
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt S3CopyLambda.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: .snappy.parquet
+
+  CostUsageReportBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CostUsageReportBucket
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: billingreports.amazonaws.com
+            Action:
+              - s3:GetBucketAcl
+              - s3:GetBucketPolicy
+            Resource: !Sub arn:aws:s3:::${CurBucketPrefix}-${AWS::AccountId}
+            Condition:
+              StringEquals:
+                aws:SourceArn: !Sub arn:aws:cur:us-east-1:${AWS::AccountId}:definition/*
+                aws:SourceAccount: !Sub ${AWS::AccountId}
+          - Effect: Allow
+            Principal:
+              Service: billingreports.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub arn:aws:s3:::${CurBucketPrefix}-${AWS::AccountId}/*
+            Condition:
+              StringEquals:
+                aws:SourceArn: !Sub arn:aws:cur:us-east-1:${AWS::AccountId}:definition/*
+                aws:SourceAccount: !Sub ${AWS::AccountId}
+
+  CostUsageReportForAthena:
+    Type: AWS::CUR::ReportDefinition
+    Properties:
+      ReportName: !Sub ${AWS::AccountId}_cur_athena
+      TimeUnit: DAILY
+      Format: Parquet
+      Compression: Parquet
+      S3Bucket: !Ref CostUsageReportBucket
+      S3Region: us-east-1
+      S3Prefix: !Sub ${AWS::AccountId}/athena
+      ReportVersioning: OVERWRITE_REPORT
+      RefreshClosedReports: true
+      AdditionalArtifacts:
+        - ATHENA
+
+  LambdaS3EventRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service: "lambda.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Policies:
+        - PolicyName: "S3CopyObjectPolicy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "s3:GetObject"
+                  - "s3:PutObject"
+                Resource:
+                  - !Sub "arn:aws:s3:::${CurBucketPrefix}-${AWS::AccountId}*" # use this format to avoid circular dependency
+                  - !Sub "arn:aws:s3:::${CurAggregationBucket}*"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  S3CopyLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Runtime: nodejs18.x
+      Timeout: 300
+      MemorySize: 512
+      Role: !GetAtt LambdaS3EventRole.Arn
+      Environment:
+        Variables:
+          TARGET_BUCKET: !Ref CurAggregationBucket
+          TARGET_DEFAULT_PATH: !Ref TargetBucketDefaultPath
+      Code:
+        ZipFile: |
+          const { S3Client, CopyObjectCommand } = require('@aws-sdk/client-s3');
+          const s3 = new S3Client({});
+
+          exports.handler = async function(event) {
+            console.log(JSON.stringify(event, null, 2));
+            const { TARGET_BUCKET, TARGET_DEFAULT_PATH } = process.env;
+            const sourceBucket = event.Records[0].s3.bucket.name;
+            const encodedSourceKey = event.Records[0].s3.object.key;
+            const sourceKey = decodeURIComponent(encodedSourceKey);
+            const accountId = /(\d{12})/.exec(sourceKey)[0];
+            const extractedKey = /(year=.*)$/.exec(sourceKey)[0];
+            const targetKey = `${TARGET_DEFAULT_PATH}account=${accountId}/${extractedKey}`;
+
+            console.log(`Copying ${sourceBucket}/${sourceKey} to ${TARGET_BUCKET}/${TARGET_DEFAULT_PATH}/${accountId}/${extractedKey}`);
+            await s3.send(new CopyObjectCommand({
+              Bucket: TARGET_BUCKET,
+              CopySource: `${sourceBucket}/${sourceKey}`,
+              Key: targetKey
+            }));
+          }
+
+  s3Permission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt S3CopyLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !GetAtt CostUsageReportBucket.Arn
+
+Outputs:
+  S3BucketName:
+    Description: Name of the S3 bucket
+    Value: !Ref CostUsageReportBucket
+
+  CURReportName:
+    Description: Name of the CUR report
+    Value: !Ref CostUsageReportForAthena
