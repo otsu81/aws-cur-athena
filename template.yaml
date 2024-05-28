@@ -6,19 +6,15 @@ Description: >
   !! NOTE !! CUR can only be created in US-EAST-1, and can only work with S3
             buckets in US-EAST-1. Cloudformation will FAIL deployment in any
             other region.
-  !! NOTE !! If deploying "fresh", the NotificationConfiguration in the bucket
-            policy will fail to deploy due to circular dependencies (known bug
-            in Cloudformation when creating lambda push events). Comment it out,
-            deploy, uncomment it, and deploy again.
 
 Parameters:
   CurBucketPrefix:
     Type: String
-    Default: cost-usage-report
+    Default: homesmart-cost-usage-report
     Description: Prefix for the CUR bucket name
   CurAggregationBucket:
     Type: String
-    Default: cost-usage-reports-aggregated
+    Default: homesmart-cost-usage-reports-aggregated
     Description: The target bucket for the CUR files. Must have a bucket policy allowing the lambda to write to it.
   TargetBucketDefaultPath:
     Type: String
@@ -28,6 +24,7 @@ Parameters:
 Resources:
   CostUsageReportBucket:
     Type: AWS::S3::Bucket
+    DependsOn: S3CopyLambda
     Properties:
       BucketName: !Sub ${CurBucketPrefix}-${AWS::AccountId}
       LifecycleConfiguration:
@@ -35,15 +32,6 @@ Resources:
           - Id: DeleteAfterTwoYears
             Status: Enabled
             ExpirationInDays: 730
-      NotificationConfiguration:
-        LambdaConfigurations:
-          - Event: s3:ObjectCreated:*
-            Function: !GetAtt S3CopyLambda.Arn
-            Filter:
-              S3Key:
-                Rules:
-                  - Name: suffix
-                    Value: .snappy.parquet
 
   CostUsageReportBucketPolicy:
     Type: AWS::S3::BucketPolicy
@@ -111,16 +99,23 @@ Resources:
                 Resource:
                   - !Sub "arn:aws:s3:::${CurBucketPrefix}-${AWS::AccountId}*" # use this format to avoid circular dependency
                   - !Sub "arn:aws:s3:::${CurAggregationBucket}*"
+              - Effect: Allow
+                Action: s3:PutBucketNotification
+                Resource:
+                  - !Sub "arn:aws:s3:::${CurBucketPrefix}-${AWS::AccountId}*"
+                  - !Sub "arn:aws:s3:::${CurBucketPrefix}-${AWS::AccountId}*/*"
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
 
   S3CopyLambda:
     Type: AWS::Lambda::Function
     Properties:
+      Runtime: python3.12
+      Timeout: 240
       Handler: index.handler
-      Runtime: nodejs18.x
-      Timeout: 300
       MemorySize: 512
+      Architectures:
+        - arm64
       Role: !GetAtt LambdaS3EventRole.Arn
       Environment:
         Variables:
@@ -128,26 +123,31 @@ Resources:
           TARGET_DEFAULT_PATH: !Ref TargetBucketDefaultPath
       Code:
         ZipFile: |
-          const { S3Client, CopyObjectCommand } = require('@aws-sdk/client-s3');
-          const s3 = new S3Client({});
+          import json
+          import os
+          import re
+          import urllib.parse
+          import boto3
 
-          exports.handler = async function(event) {
-            console.log(JSON.stringify(event, null, 2));
-            const { TARGET_BUCKET, TARGET_DEFAULT_PATH } = process.env;
-            const sourceBucket = event.Records[0].s3.bucket.name;
-            const encodedSourceKey = event.Records[0].s3.object.key;
-            const sourceKey = decodeURIComponent(encodedSourceKey);
-            const accountId = /(\d{12})/.exec(sourceKey)[0];
-            const extractedKey = /(year=.*)$/.exec(sourceKey)[0];
-            const targetKey = `${TARGET_DEFAULT_PATH}account=${accountId}/${extractedKey}`;
+          s3 = boto3.client('s3')
 
-            console.log(`Copying ${sourceBucket}/${sourceKey} to ${TARGET_BUCKET}/${TARGET_DEFAULT_PATH}/${accountId}/${extractedKey}`);
-            await s3.send(new CopyObjectCommand({
-              Bucket: TARGET_BUCKET,
-              CopySource: `${sourceBucket}/${sourceKey}`,
-              Key: targetKey
-            }));
-          }
+          def handler(event, context):
+              print(json.dumps(event))
+              target_bucket = os.environ['TARGET_BUCKET']
+              target_default_path = os.environ['TARGET_DEFAULT_PATH']
+              source_bucket = event['Records'][0]['s3']['bucket']['name']
+              encoded_source_key = event['Records'][0]['s3']['object']['key']
+              source_key = urllib.parse.unquote(encoded_source_key)
+              account_id = re.search(r'(\d{12})', source_key).group(0)
+              extracted_key = re.search(r'(year=.*)$', source_key).group(0)
+              target_key = f"{target_default_path}account={account_id}/{extracted_key}"
+
+              print(f"Copying {source_bucket}/{source_key} to {target_bucket}/{target_default_path}/{account_id}/{extracted_key}")
+              s3.copy_object(
+                  Bucket=target_bucket,
+                  CopySource=f"{source_bucket}/{source_key}",
+                  Key=target_key
+              )
 
   s3Permission:
     Type: AWS::Lambda::Permission
@@ -157,6 +157,98 @@ Resources:
       Principal: s3.amazonaws.com
       SourceAccount: !Ref AWS::AccountId
       SourceArn: !GetAtt CostUsageReportBucket.Arn
+
+  ApplyBucketNotificationFunction: # used by custom resource to apply bucket notification after creation
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Timeout: 240
+      Handler: index.handler
+      MemorySize: 512
+      Architectures:
+        - arm64
+      Role: !GetAtt LambdaS3EventRole.Arn
+      Description: Custom resource for applying S3 bucket notification
+      Code:
+        ZipFile: |
+          import boto3
+          import logging
+          import json
+          import cfnresponse
+
+          s3Client = boto3.client('s3')
+          logger = logging.getLogger()
+          logger.setLevel(logging.DEBUG)
+
+          def addBucketNotification(bucketName, notificationId, functionArn):
+            notificationResponse = s3Client.put_bucket_notification_configuration(
+              Bucket=bucketName,
+              NotificationConfiguration={
+                'LambdaFunctionConfigurations': [
+                  {
+                    'Id': notificationId,
+                    'LambdaFunctionArn': functionArn,
+                    'Events': [
+                      's3:ObjectCreated:*'
+                    ],
+                    'Filter': {
+                      'Key': {
+                        'FilterRules': [
+                          {
+                            'Name': 'suffix',
+                            'Value': '.snappy.parquet'
+                          }
+                        ]
+                      }
+                    }
+                  },
+                ]
+              }
+            )
+            return notificationResponse
+
+          def create(properties, physical_id):
+            bucketName = properties['S3Bucket']
+            notificationId = properties['NotificationId']
+            functionArn = properties['FunctionARN']
+            response = addBucketNotification(bucketName, notificationId, functionArn)
+            logger.info('AddBucketNotification response: %s' % json.dumps(response))
+            return cfnresponse.SUCCESS, physical_id
+
+          def update(properties, physical_id):
+            return cfnresponse.SUCCESS, None
+
+          def delete(properties, physical_id):
+            return cfnresponse.SUCCESS, None
+
+          def handler(event, context):
+            logger.info('Received event: %s' % json.dumps(event))
+
+            status = cfnresponse.FAILED
+            new_physical_id = None
+
+            try:
+              properties = event.get('ResourceProperties')
+              physical_id = event.get('PhysicalResourceId')
+
+              status, new_physical_id = {
+                'Create': create,
+                'Update': update,
+                'Delete': delete
+              }.get(event['RequestType'], lambda x, y: (cfnresponse.FAILED, None))(properties, physical_id)
+            except Exception as e:
+              logger.error('Exception: %s' % e)
+              status = cfnresponse.FAILED
+            finally:
+              cfnresponse.send(event, context, status, {}, new_physical_id)
+
+  ApplyNotification:
+    Type: Custom::ApplyNotification
+    Properties:
+      ServiceToken: !GetAtt ApplyBucketNotificationFunction.Arn
+      S3Bucket: !Ref CostUsageReportBucket
+      FunctionARN: !GetAtt S3CopyLambda.Arn
+      NotificationId: S3ObjectCreatedEvent
 
 Outputs:
   S3BucketName:
