@@ -40,12 +40,6 @@ ORDER BY d.daily_cost DESC;
 See [SQL directory](./sql/) for example queries.
 
 # Deployment details
-### "Fresh"/New Deployment gotcha
-There's a circular dependency when deploying S3 buckets with Lambda triggers, [it's a known problem](https://aws.amazon.com/blogs/mt/resolving-circular-dependency-in-provisioning-of-amazon-s3-buckets-with-aws-lambda-event-notifications/).
-
-To keep the template as brief as possible we have opted to not use the custom resource solution, and instead you will need to deploy the template twice.
-1. Comment out the event part of the S3 bucket, and deploy
-1. Once deployment is completed, remove the comment and deploy again
 
 ### US-EAST-1 requirement
 Note that any deployment must be made from US-EAST-1, as it's the only region that supports the `AWS::CUR::ReportDefinition` resource.
